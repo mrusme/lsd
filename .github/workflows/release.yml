@@ -1,0 +1,139 @@
+name: release
+
+on:
+  push:
+    tags: ["*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
+  build:
+    needs: check
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.optional || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu, os: ubuntu-latest, cross: true }
+          - { target: x86_64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: i686-unknown-linux-gnu, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-gnu, os: ubuntu-latest, cross: true }
+          - { target: aarch64-unknown-linux-musl, os: ubuntu-latest, cross: true }
+          - { target: armv7-unknown-linux-gnueabihf, os: ubuntu-latest, cross: true }
+          - { target: aarch64-apple-darwin, os: macos-latest }
+          - { target: x86_64-pc-windows-msvc, os: windows-latest }
+          - { target: i686-pc-windows-msvc, os: windows-latest }
+          - { target: i686-unknown-linux-musl, os: ubuntu-latest, cross: true, optional: true }
+          - { target: armv7-unknown-linux-musleabihf, os: ubuntu-latest, cross: true, optional: true }
+          - { target: x86_64-unknown-freebsd, os: ubuntu-latest, cross: true, optional: true }
+          - { target: aarch64-pc-windows-msvc, os: windows-latest, optional: true }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        if: matrix.cross
+        with:
+          tool: cross
+
+      - name: Build
+        shell: bash
+        run: |
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="lsd-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          if [ -f "target/${{ matrix.target }}/release/lsd.exe" ]; then
+            cp "target/${{ matrix.target }}/release/lsd.exe" "dist/${name}/"
+          else
+            cp "target/${{ matrix.target }}/release/lsd" "dist/${name}/"
+          fi
+          cp README.md LICENSE "dist/${name}/"
+          cd dist
+          case "${{ matrix.target }}" in
+            *windows*) 7z a -tzip "${name}.zip" "${name}" >/dev/null ;;
+            *)         tar -czf "${name}.tar.gz" "${name}" ;;
+          esac
+          rm -rf "${name}"
+
+      - name: Smoke test
+        if: ${{ !matrix.cross && matrix.target != 'aarch64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          binary="target/${{ matrix.target }}/release/lsd"
+          [ -f "${binary}.exe" ] && binary="${binary}.exe"
+          "$binary" --version
+          "$binary" --help > /dev/null
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls lsd-* >/dev/null 2>&1 || { echo "no artifacts were produced"; exit 1; }
+          sha256sum lsd-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
